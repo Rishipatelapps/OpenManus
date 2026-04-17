@@ -64,27 +64,36 @@ api_key = "your-api-key"
 GET /health
 ```
 
-### Execute Task
+### Execute Task (async)
 ```bash
 POST /api/execute
 Content-Type: application/json
 
-{
-  "prompt": "Your task here",
-  "max_steps": 10
-}
+{ "prompt": "Your task here" }
 ```
 
-Response:
+Returns `202 Accepted` immediately with a `task_id`:
 ```json
 {
-  "status": "completed",
-  "result": "Task result here",
-  "error": null
+  "status": "processing",
+  "task_id": "29ebfef3ec354a66be3926cb1d1b409a",
+  "message": "Task queued for execution"
 }
 ```
 
-### Get Status
+### Poll Task Result
+```bash
+GET /api/task/<task_id>
+```
+
+Returns one of:
+```json
+{ "status": "processing" }
+{ "status": "completed", "result": "..." }
+{ "status": "error", "error": "..." }
+```
+
+### Server Status
 ```bash
 GET /api/status
 ```
