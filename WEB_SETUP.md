@@ -115,7 +115,7 @@ GET /api/status
 
 To extend the web interface:
 
-1. Modify `backend_server.py` to add new API endpoints
+1. Modify `simple_backend.py` to add new API endpoints
 2. Update `web-frontend.html` to add new UI features
 3. Test thoroughly before committing
 

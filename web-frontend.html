@@ -270,6 +270,21 @@
             }
         }
 
+        const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+        async function pollTask(taskId) {
+            // Poll every 2s until the task finishes (completed or error).
+            while (true) {
+                const res = await fetch(`${API_BASE}/api/task/${taskId}`);
+                if (!res.ok) throw new Error(`Status poll failed: ${res.status}`);
+                const data = await res.json();
+                if (data.status === 'completed' || data.status === 'error') {
+                    return data;
+                }
+                await sleep(2000);
+            }
+        }
+
         // Handle form submission
         taskForm.addEventListener('submit', async (e) => {
             e.preventDefault();
@@ -290,20 +305,26 @@
             try {
                 const response = await fetch(`${API_BASE}/api/execute`, {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
+                    headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ prompt })
                 });
 
-                const data = await response.json();
+                const queued = await response.json();
 
-                if (response.ok) {
-                    outputSection.style.display = 'block';
-                    outputEl.textContent = data.result || 'Task completed successfully';
+                if (!response.ok || !queued.task_id) {
+                    errorEl.textContent = queued.error || queued.detail || 'Error queuing task';
+                    return;
+                }
+
+                outputSection.style.display = 'block';
+                outputEl.textContent = `Task ${queued.task_id} queued. Running...`;
+
+                const final = await pollTask(queued.task_id);
+                if (final.status === 'completed') {
+                    outputEl.textContent = final.result || 'Task completed successfully';
                     successEl.textContent = '✓ Task completed';
                 } else {
-                    errorEl.textContent = data.detail || 'Error executing task';
+                    errorEl.textContent = final.error || 'Task failed';
                 }
             } catch (error) {
                 errorEl.textContent = `Connection error: ${error.message}`;

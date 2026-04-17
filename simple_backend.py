@@ -7,190 +7,153 @@ This version has minimal dependencies and wraps the core agent functionality
 import asyncio
 import json
 import logging
+import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse
 import threading
-from typing import Optional
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Global state
-_agent_instance = None
-_agent_lock = threading.Lock()
 _task_results = {}
+_task_lock = threading.Lock()
 
-async def get_or_create_agent():
-    """Lazy load the agent"""
-    global _agent_instance
-    if _agent_instance is None:
-        try:
-            from app.agent.manus import Manus
-            _agent_instance = await Manus.create()
-            logger.info("✅ Agent initialized successfully")
-        except Exception as e:
-            logger.error(f"❌ Failed to initialize agent: {e}")
-            raise
-    return _agent_instance
+
+def _send_json(handler, status_code, payload):
+    """Send a JSON response with correct HTTP header ordering."""
+    body = json.dumps(payload).encode()
+    handler.send_response(status_code)
+    handler.send_header('Content-Type', 'application/json')
+    handler.send_header('Content-Length', str(len(body)))
+    handler.send_header('Access-Control-Allow-Origin', '*')
+    handler.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+    handler.send_header('Access-Control-Allow-Headers', 'Content-Type')
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def _run_task(task_id, prompt):
+    """Execute a task in its own event loop with a fresh agent instance.
+
+    Each task creates its own Manus agent because asyncio objects are bound
+    to the event loop they were created in; sharing across threads/loops
+    causes RuntimeError.
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    agent = None
+    try:
+        from app.agent.manus import Manus
+        agent = loop.run_until_complete(Manus.create())
+        loop.run_until_complete(agent.run(prompt))
+        with _task_lock:
+            _task_results[task_id] = {
+                "status": "completed",
+                "result": "Task executed successfully",
+            }
+        logger.info(f"Task {task_id} completed")
+    except Exception as e:
+        with _task_lock:
+            _task_results[task_id] = {"status": "error", "error": str(e)}
+        logger.error(f"Task {task_id} failed: {e}")
+    finally:
+        if agent is not None:
+            try:
+                loop.run_until_complete(agent.cleanup())
+            except Exception as e:
+                logger.warning(f"Agent cleanup failed for task {task_id}: {e}")
+        loop.close()
+
 
 class AgentRequestHandler(BaseHTTPRequestHandler):
     """HTTP Request Handler for OpenManus Web API"""
 
     def do_GET(self):
-        """Handle GET requests"""
-        parsed_path = urlparse(self.path)
-        path = parsed_path.path
-
-        # CORS headers
-        self.send_response(200)
-        self.send_header('Content-type', 'application/json')
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
-        self.end_headers()
+        path = urlparse(self.path).path
 
         if path == '/health':
-            response = {"status": "healthy", "agent": "ready"}
-            self.wfile.write(json.dumps(response).encode())
+            _send_json(self, 200, {"status": "healthy"})
+            return
 
-        elif path == '/api/status':
-            response = {"status": "ready", "agent": _agent_instance is not None}
-            self.wfile.write(json.dumps(response).encode())
+        if path == '/api/status':
+            _send_json(self, 200, {"status": "ready"})
+            return
 
-        else:
-            response = {"error": "Not found"}
-            self.send_response(404)
-            self.wfile.write(json.dumps(response).encode())
+        if path.startswith('/api/task/'):
+            task_id = path[len('/api/task/'):]
+            with _task_lock:
+                result = _task_results.get(task_id)
+            if result is None:
+                _send_json(self, 404, {"error": "Task not found"})
+            else:
+                _send_json(self, 200, result)
+            return
+
+        _send_json(self, 404, {"error": "Not found"})
 
     def do_POST(self):
-        """Handle POST requests"""
-        parsed_path = urlparse(self.path)
-        path = parsed_path.path
+        path = urlparse(self.path).path
         content_length = int(self.headers.get('Content-Length', 0))
 
-        # CORS headers
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        if path != '/api/execute':
+            _send_json(self, 404, {"error": "Not found"})
+            return
 
-        if path == '/api/execute':
-            try:
-                body = self.rfile.read(content_length).decode('utf-8')
-                data = json.loads(body)
-                prompt = data.get('prompt', '').strip()
+        try:
+            body = self.rfile.read(content_length).decode('utf-8')
+            data = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            _send_json(self, 400, {"error": "Invalid JSON"})
+            return
 
-                if not prompt:
-                    self.send_response(400)
-                    self.send_header('Content-type', 'application/json')
-                    self.end_headers()
-                    response = {"error": "Prompt cannot be empty"}
-                    self.wfile.write(json.dumps(response).encode())
-                    return
+        prompt = (data.get('prompt') or '').strip()
+        if not prompt:
+            _send_json(self, 400, {"error": "Prompt cannot be empty"})
+            return
 
-                # Execute task asynchronously
-                task_id = str(len(_task_results))
-                logger.info(f"📝 Executing task {task_id}: {prompt[:100]}...")
+        task_id = uuid.uuid4().hex
+        with _task_lock:
+            _task_results[task_id] = {"status": "processing"}
 
-                # Run in background
-                def execute_task():
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    try:
-                        agent = loop.run_until_complete(get_or_create_agent())
-                        loop.run_until_complete(agent.run(prompt))
-                        _task_results[task_id] = {
-                            "status": "completed",
-                            "result": "Task executed successfully"
-                        }
-                        logger.info(f"✅ Task {task_id} completed")
-                    except Exception as e:
-                        _task_results[task_id] = {
-                            "status": "error",
-                            "error": str(e)
-                        }
-                        logger.error(f"❌ Task {task_id} failed: {e}")
-                    finally:
-                        loop.close()
+        logger.info(f"Executing task {task_id}: {prompt[:100]}")
+        threading.Thread(
+            target=_run_task, args=(task_id, prompt), daemon=True
+        ).start()
 
-                thread = threading.Thread(target=execute_task, daemon=True)
-                thread.start()
-
-                # Immediate response
-                self.send_response(200)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                response = {
-                    "status": "processing",
-                    "task_id": task_id,
-                    "message": "Task queued for execution"
-                }
-                self.wfile.write(json.dumps(response).encode())
-
-            except json.JSONDecodeError:
-                self.send_response(400)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                response = {"error": "Invalid JSON"}
-                self.wfile.write(json.dumps(response).encode())
-
-            except Exception as e:
-                self.send_response(500)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                response = {"error": str(e)}
-                self.wfile.write(json.dumps(response).encode())
-                logger.error(f"Error: {e}")
-
-        else:
-            self.send_response(404)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            response = {"error": "Not found"}
-            self.wfile.write(json.dumps(response).encode())
+        _send_json(self, 202, {
+            "status": "processing",
+            "task_id": task_id,
+            "message": "Task queued for execution",
+        })
 
     def do_OPTIONS(self):
-        """Handle CORS preflight"""
-        self.send_response(200)
+        self.send_response(204)
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type')
         self.end_headers()
 
     def log_message(self, format, *args):
-        """Suppress default logging"""
-        if args[1] != 200:
-            logger.info(f"{args[0]} - {args[1]}")
+        logger.info("%s - %s", self.address_string(), format % args)
+
 
 def run_server(host='0.0.0.0', port=8000):
-    """Start the HTTP server"""
-    server_address = (host, port)
-    httpd = HTTPServer(server_address, AgentRequestHandler)
-
-    logger.info(f"")
-    logger.info(f"🌐 OpenManus Web Backend")
-    logger.info(f"📡 Server running at http://{host}:{port}")
-    logger.info(f"")
-    logger.info(f"Endpoints:")
-    logger.info(f"  GET  /health          - Health check")
-    logger.info(f"  POST /api/execute     - Execute task")
-    logger.info(f"  GET  /api/status      - Get server status")
-    logger.info(f"")
-    logger.info(f"Frontend available at: http://localhost:5000/web-frontend.html")
-    logger.info(f"")
-    logger.info(f"Press Ctrl+C to stop")
-    logger.info(f"")
-
+    httpd = HTTPServer((host, port), AgentRequestHandler)
+    logger.info(f"OpenManus Web Backend running at http://{host}:{port}")
+    logger.info("Endpoints:")
+    logger.info("  GET  /health")
+    logger.info("  POST /api/execute")
+    logger.info("  GET  /api/task/<task_id>")
+    logger.info("  GET  /api/status")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         logger.info("Shutting down...")
         httpd.shutdown()
 
+
 if __name__ == '__main__':
     import sys
-
     host = sys.argv[1] if len(sys.argv) > 1 else '0.0.0.0'
     port = int(sys.argv[2]) if len(sys.argv) > 2 else 8000
-
     run_server(host, port)
