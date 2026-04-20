@@ -6,6 +6,7 @@ import sys
 from app.agent.mcp import MCPAgent
 from app.config import config
 from app.logger import logger
+from app.tool.voice_tool import format_voices_list, _load_voices
 
 
 class MCPRunner:
@@ -37,11 +38,14 @@ class MCPRunner:
 
     async def run_interactive(self) -> None:
         """Run the agent in interactive mode."""
-        print("\nMCP Agent Interactive Mode (type 'exit' to quit)\n")
+        print("\nMCP Agent Interactive Mode (type 'exit' to quit, '/voices' to list cloned voices)\n")
         while True:
             user_input = input("\nEnter your request: ")
             if user_input.lower() in ["exit", "quit", "q"]:
                 break
+            if user_input.strip().lower() == "/voices":
+                print(format_voices_list(_load_voices()))
+                continue
             response = await self.agent.run(user_input)
             print(f"\nAgent: {response}")
 
