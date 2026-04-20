@@ -3,6 +3,16 @@ import asyncio
 
 from app.agent.manus import Manus
 from app.logger import logger
+from app.tool.voice_tool import format_voices_list, _load_voices
+
+
+def _handle_slash_command(command: str) -> bool:
+    """Handle built-in slash commands. Returns True if command was handled."""
+    cmd = command.strip().lower()
+    if cmd == "/voices":
+        print(format_voices_list(_load_voices()))
+        return True
+    return False
 
 
 async def main():
@@ -20,6 +30,9 @@ async def main():
         prompt = args.prompt if args.prompt else input("Enter your prompt: ")
         if not prompt.strip():
             logger.warning("Empty prompt provided.")
+            return
+
+        if _handle_slash_command(prompt):
             return
 
         logger.warning("Processing your request...")
